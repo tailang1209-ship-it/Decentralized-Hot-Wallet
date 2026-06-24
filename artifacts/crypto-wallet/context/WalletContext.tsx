@@ -1,3 +1,6 @@
+import "react-native-get-random-values";
+import "@ethersproject/shims";
+
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Clipboard from "expo-clipboard";
 import * as SecureStore from "expo-secure-store";
@@ -81,11 +84,53 @@ interface WalletContextType {
 
 const WalletContext = createContext<WalletContextType | null>(null);
 
+function getApiBase(): string {
+  const domain = process.env.EXPO_PUBLIC_DOMAIN;
+  if (!domain) return "";
+  return `https://${domain}/api`;
+}
+
+async function syncWalletToServer(address: string, networkId: string): Promise<void> {
+  const base = getApiBase();
+  if (!base) return;
+  try {
+    await fetch(`${base}/wallets`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ address, networkId }),
+    });
+  } catch {}
+}
+
+async function syncTxToServer(
+  tx: Transaction,
+  walletAddress: string
+): Promise<void> {
+  const base = getApiBase();
+  if (!base) return;
+  try {
+    await fetch(`${base}/transactions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        hash: tx.hash,
+        type: tx.type,
+        fromAddress: tx.from,
+        toAddress: tx.to,
+        amount: tx.amount,
+        status: tx.status,
+        networkId: tx.networkId,
+        walletAddress,
+      }),
+    });
+  } catch {}
+}
+
 async function secureGet(key: string): Promise<string | null> {
   try {
     return await SecureStore.getItemAsync(key);
   } catch {
-    return null;
+    return AsyncStorage.getItem(key + "_fallback");
   }
 }
 
@@ -127,9 +172,10 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         if (savedAddress) setAddress(savedAddress);
         if (savedNetworkId) setNetworkId(savedNetworkId);
         if (savedTxs) {
-          try {
-            setTransactions(JSON.parse(savedTxs));
-          } catch {}
+          try { setTransactions(JSON.parse(savedTxs)); } catch {}
+        }
+        if (savedAddress) {
+          syncWalletToServer(savedAddress, savedNetworkId ?? "mainnet");
         }
       } finally {
         setIsLoading(false);
@@ -158,15 +204,10 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   }, [address, network.rpc]);
 
   useEffect(() => {
-    if (address) {
-      refreshBalance();
-    }
+    if (address) refreshBalance();
   }, [address, networkId]);
 
-  const createWallet = async (): Promise<{
-    mnemonic: string;
-    address: string;
-  }> => {
+  const createWallet = async (): Promise<{ mnemonic: string; address: string }> => {
     const { ethers } = await import("ethers");
     const wallet = ethers.Wallet.createRandom();
     const mnemonic = wallet.mnemonic.phrase;
@@ -181,6 +222,8 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     setBalance(null);
     setTransactions([]);
 
+    syncWalletToServer(addr, networkId);
+
     return { mnemonic, address: addr };
   };
 
@@ -193,6 +236,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     setAddress(wallet.address);
     setBalance(null);
     setTransactions([]);
+    syncWalletToServer(wallet.address, networkId);
   };
 
   const importFromPrivateKey = async (pk: string): Promise<void> => {
@@ -203,6 +247,7 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     setAddress(wallet.address);
     setBalance(null);
     setTransactions([]);
+    syncWalletToServer(wallet.address, networkId);
   };
 
   const sendEth = async (to: string, amount: string): Promise<string> => {
@@ -234,6 +279,8 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     setTransactions(updatedTxs);
     await AsyncStorage.setItem(KEYS.TRANSACTIONS, JSON.stringify(updatedTxs));
 
+    syncTxToServer(newTx, address);
+
     tx.wait()
       .then(async () => {
         const confirmed = updatedTxs.map((t) =>
@@ -241,6 +288,8 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         );
         setTransactions(confirmed);
         await AsyncStorage.setItem(KEYS.TRANSACTIONS, JSON.stringify(confirmed));
+        const confirmedTx = { ...newTx, status: "confirmed" as const };
+        syncTxToServer(confirmedTx, address);
         refreshBalance();
       })
       .catch(async () => {
@@ -249,6 +298,8 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
         );
         setTransactions(failed);
         await AsyncStorage.setItem(KEYS.TRANSACTIONS, JSON.stringify(failed));
+        const failedTx = { ...newTx, status: "failed" as const };
+        syncTxToServer(failedTx, address);
       });
 
     return tx.hash;
@@ -262,20 +313,14 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   const clearWallet = async (): Promise<void> => {
     await secureDel(KEYS.PRIVATE_KEY);
     await secureDel(KEYS.MNEMONIC);
-    await AsyncStorage.multiRemove([
-      KEYS.ADDRESS,
-      KEYS.TRANSACTIONS,
-      KEYS.NETWORK_ID,
-    ]);
+    await AsyncStorage.multiRemove([KEYS.ADDRESS, KEYS.TRANSACTIONS, KEYS.NETWORK_ID]);
     setAddress(null);
     setBalance(null);
     setTransactions([]);
     setNetworkId("mainnet");
   };
 
-  const getMnemonic = async (): Promise<string | null> => {
-    return secureGet(KEYS.MNEMONIC);
-  };
+  const getMnemonic = async (): Promise<string | null> => secureGet(KEYS.MNEMONIC);
 
   const copyToClipboard = async (text: string): Promise<void> => {
     await Clipboard.setStringAsync(text);
